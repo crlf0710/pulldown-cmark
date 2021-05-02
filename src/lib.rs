@@ -59,6 +59,8 @@
 use serde::{Deserialize, Serialize};
 
 pub mod html;
+#[cfg(feature = "roundtrip")]
+pub mod roundtrip;
 
 mod entities;
 pub mod escape;
