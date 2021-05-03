@@ -1,6 +1,6 @@
 #![allow(dead_code, unused_mut)]
 use crate::escape::{StrWrite, WriteWrapper};
-use crate::CodeBlockKind;
+use crate::{CodeBlockKind, LinkType};
 use crate::{Event, Tag};
 use std::io::{self, Write};
 
@@ -69,6 +69,7 @@ fn is_leaf_block_start(event: &Event<'_>) -> bool {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+#[allow(non_camel_case_types)]
 enum tri_bool {
     r#true,
     r#false,
@@ -91,7 +92,7 @@ fn is_childless_block_2(context: &[Event<'_>], event: &Event<'_>) -> bool {
     if matches!(event, Event::Rule) {
         true
     } else if matches!(event, Event::Html(_)) {
-        context.last().map_or(true, is_leaf_block_start)
+        !context.last().map_or(false, is_leaf_block_start)
     } else {
         false
     }
@@ -115,12 +116,12 @@ where
         let mut incoming_stack = vec![];
         let mut outgoing_counter = 0;
         let mut iter = self.iter.peekable();
-        /// In general, we split markdown generation into a sequence of four actions
-        /// 1. Encountering a series of starts of block containers
-        /// 2. Encountering a series of inlines
-        /// 3. Encountering one leaf block
-        /// 4. Encountering a series of endings of block containers
-        /// 5. Transition over the valley between block containers
+        // In general, we split markdown generation into a sequence of four actions
+        // 1. Encountering a series of starts of block containers
+        // 2. Encountering a series of inlines
+        // 3. Encountering one leaf block
+        // 4. Encountering a series of endings of block containers
+        // 5. Transition over the valley between block containers
         let mut state = 0;
         loop {
             let mut new_state = 0;
@@ -138,14 +139,17 @@ where
                             new_state = 2;
                         }
                         tri_bool::maybe => {
-                            let context = if state == 4 {
+                            let mut context = if state == 4 {
                                 let remaining_stack_len =
                                     stack.len().checked_sub(outgoing_counter).unwrap();
-                                &stack[0..remaining_stack_len]
+                                stack[0..remaining_stack_len].iter().cloned().collect()
                             } else {
-                                &stack
+                                stack.clone()
                             };
-                            if is_childless_block_2(context, event) {
+                            if state == 1 {
+                                context.extend(incoming_stack.iter().cloned());
+                            }
+                            if is_childless_block_2(&context, event) {
                                 new_state = 3;
                             } else {
                                 new_state = 2;
@@ -203,7 +207,7 @@ where
                         &incoming_stack,
                     )?;
                 }
-                Self::process_enter_nesting(&mut self.writer, &stack, &incoming_stack)?;
+                Self::process_enter_nesting(&mut self.writer, &mut stack, &incoming_stack)?;
                 stack.drain(remaining_stack_len..);
                 stack.extend(incoming_stack.drain(..));
             } else if state == 2 {
@@ -234,7 +238,7 @@ where
                     )?;
                 }
                 outgoing_counter = 0;
-                Self::process_enter_nesting(&mut self.writer, &stack, &incoming_stack)?;
+                Self::process_enter_nesting(&mut self.writer, &mut stack, &incoming_stack)?;
                 stack.extend(incoming_stack.drain(..));
                 outgoing_counter += 1;
                 new_state = 4;
@@ -243,7 +247,6 @@ where
                 let _ = iter.next();
                 outgoing_counter += 1;
             } else {
-                outgoing_counter = 0;
                 return Ok(());
             }
             state = new_state;
@@ -271,8 +274,16 @@ where
                 ([Event::Start(Tag::Paragraph)], [Event::Start(Tag::Paragraph)]) => {
                     strategy = Some(TransitionStrategy::ExtraNewlineAndRenew);
                 }
-                _ => {
+                (
+                    [Event::Start(Tag::BlockQuote), Event::Start(Tag::Paragraph)],
+                    [Event::Start(Tag::BlockQuote), Event::Start(Tag::Paragraph)],
+                ) => {
+                    strategy = Some(TransitionStrategy::ExtraNewlineAndRenew);
                 }
+                ([Event::Html(_)], [Event::Html(_)]) => {
+                    strategy = Some(TransitionStrategy::DoNothing);
+                }
+                _ => {}
             }
         }
 
@@ -281,8 +292,7 @@ where
                 [Event::Start(Tag::List(_)), ..] => {
                     strategy = Some(TransitionStrategy::ExtraNewlineAndRenew);
                 }
-                _ => {
-                }
+                _ => {}
             }
         }
 
@@ -316,7 +326,7 @@ where
     }
     fn process_enter_nesting(
         writer: &mut W,
-        context: &[Event<'_>],
+        context: &mut [Event<'_>],
         sequence: &[Event<'_>],
     ) -> io::Result<()> {
         if sequence.is_empty() {
@@ -336,6 +346,9 @@ where
                     writer.write_str(level_str)?;
                     writer.write_str(" ")?;
                 }
+                Tag::BlockQuote => {
+                    writer.write_str("> ")?;
+                }
                 Tag::CodeBlock(CodeBlockKind::Indented) => {
                     writer.write_str("    ")?;
                 }
@@ -344,6 +357,20 @@ where
                     writer.write_str(str)?;
                     writer.write_str("\n")?;
                 }
+                Tag::Item => match context.last_mut() {
+                    Some(Event::Start(Tag::List(style))) => {
+                        if let Some(idx) = style {
+                            *idx += 1;
+                            let str = format!("{}. ", idx);
+                            writer.write_str(&str)?;
+                        } else {
+                            writer.write_str("* ")?;
+                        }
+                    }
+                    _ => {
+                        eprintln!("item encountered but list context not found: {:?}", context);
+                    }
+                },
                 _ => {
                     eprintln!("unhandled enter nesting event {:?}", sequence);
                 }
@@ -358,7 +385,36 @@ where
                     writer.write_str(&str)?;
                 }
                 (Tag::BlockQuote, Tag::Paragraph) => {
-                    writer.write_str(">")?;
+                    writer.write_str("> ")?;
+                }
+                (Tag::BlockQuote, Tag::Heading(level)) => {
+                    writer.write_str("> ")?;
+                    let level_str = &"#######"[..(*level) as usize];
+                    writer.write_str(level_str)?;
+                    writer.write_str(" ")?;
+                }
+                (Tag::Item, Tag::Paragraph) => match context.last_mut() {
+                    Some(Event::Start(Tag::List(style))) => {
+                        if let Some(idx) = style {
+                            *idx += 1;
+                            let str = format!("{}. ", idx);
+                            writer.write_str(&str)?;
+                        } else {
+                            writer.write_str("* ")?;
+                        }
+                    }
+                    _ => {
+                        eprintln!("item encountered but list context not found: {:?}", context);
+                    }
+                },
+                _ => {
+                    eprintln!("unhandled enter nesting event {:?}", sequence);
+                }
+            }
+        } else if let [Event::Start(tag1), Event::Start(tag2), Event::Start(tag3)] = sequence {
+            match (tag1, tag2, tag3) {
+                (Tag::List(None), Tag::Item, Tag::Paragraph) => {
+                    writer.write_str("* ")?;
                 }
                 _ => {
                     eprintln!("unhandled enter nesting event {:?}", sequence);
@@ -371,7 +427,7 @@ where
     }
     fn process_exit_nesting(
         writer: &mut W,
-        context: &[Event<'_>],
+        _context: &[Event<'_>],
         sequence: &[Event<'_>],
     ) -> io::Result<()> {
         if sequence.is_empty() {
@@ -385,7 +441,7 @@ where
                 Tag::CodeBlock(CodeBlockKind::Indented) => {
                     // do nothing
                 }
-                Tag::CodeBlock(CodeBlockKind::Fenced(str)) => {
+                Tag::CodeBlock(CodeBlockKind::Fenced(_)) => {
                     writer.write_str("````")?;
                 }
                 _ => {
@@ -412,17 +468,41 @@ where
                 Tag::CodeBlock(CodeBlockKind::Indented) => {
                     writer.write_str("    ")?;
                 }
+                Tag::BlockQuote => {
+                    writer.write_str("> ")?;
+                }
                 Tag::List(None) => {
-                    writer.write_str("* ")?;
+                    writer.write_str("  ")?;
                 }
                 _ => {
                     eprintln!("unhandled renew context at new line {:?}", context);
                 }
             }
-        } else if let [Event::Start(tag1), Event::Start(tag2), Event::Start(tag3), Event::Start(tag4)] = context {
+        } else if let [Event::Start(tag1), Event::Start(tag2)] = context {
+            match (tag1, tag2) {
+                (Tag::List(None), Tag::Item) => {
+                    writer.write_str("  ")?;
+                }
+                (Tag::List(Some(idx)), Tag::Item) => {
+                    let str = format!("{}. ", idx)
+                        .chars()
+                        .map(|_| ' ')
+                        .collect::<String>();
+                    writer.write_str(&str)?;
+                }
+                (Tag::BlockQuote, Tag::Paragraph) => {
+                    writer.write_str("> ")?;
+                }
+                _ => {
+                    eprintln!("unhandled renew context at new line {:?}", context);
+                }
+            }
+        } else if let [Event::Start(tag1), Event::Start(tag2), Event::Start(tag3), Event::Start(tag4)] =
+            context
+        {
             match (tag1, tag2, tag3, tag4) {
                 (Tag::List(None), Tag::Item, Tag::List(None), Tag::Item) => {
-                    writer.write_str("  * ")?;
+                    writer.write_str("    ")?;
                 }
                 _ => {
                     eprintln!("unhandled renew context at new line {:?}", context);
@@ -470,6 +550,43 @@ where
                 let _ = iter.next();
             } else if let Event::End(Tag::Strong) = event {
                 writer.write_str("**")?;
+                let _ = iter.next();
+            } else if let Event::Html(html_str) = event {
+                writer.write_str(&**html_str)?;
+                let _ = iter.next();
+            } else if let Event::Start(Tag::Link(kind, _, _)) = event {
+                // FIXME
+                match kind {
+                    LinkType::Autolink => {
+                        writer.write_str("<")?;
+                    }
+                    _ => {
+                        writer.write_str("[")?;
+                    }
+                }
+                let _ = iter.next();
+            } else if let Event::End(Tag::Link(kind, target, _)) = event {
+                // FIXME
+                match kind {
+                    LinkType::Autolink => {
+                        writer.write_str(">")?;
+                    }
+                    _ => {
+                        writer.write_str("](")?;
+                        writer.write_str(target)?;
+                        writer.write_str(")")?;
+                    }
+                }
+                let _ = iter.next();
+            } else if let Event::Start(Tag::Image(_, _, _)) = event {
+                // FIXME
+                writer.write_str("![")?;
+                let _ = iter.next();
+            } else if let Event::End(Tag::Image(_, target, _)) = event {
+                // FIXME
+                writer.write_str("](")?;
+                writer.write_str(target)?;
+                writer.write_str(")")?;
                 let _ = iter.next();
             } else {
                 eprintln!("unhandled output event {:?}", event);
