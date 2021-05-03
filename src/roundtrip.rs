@@ -274,6 +274,9 @@ where
                 ([Event::Start(Tag::Paragraph)], [Event::Start(Tag::Paragraph)]) => {
                     strategy = Some(TransitionStrategy::ExtraNewlineAndRenew);
                 }
+                ([Event::Start(Tag::Heading(_))], [Event::Start(Tag::Heading(_))]) => {
+                    strategy = Some(TransitionStrategy::NewlineAndRenew);
+                }
                 (
                     [Event::Start(Tag::BlockQuote), Event::Start(Tag::Paragraph)],
                     [Event::Start(Tag::BlockQuote), Event::Start(Tag::Paragraph)],
@@ -557,7 +560,7 @@ where
             } else if let Event::Start(Tag::Link(kind, _, _)) = event {
                 // FIXME
                 match kind {
-                    LinkType::Autolink => {
+                    LinkType::Autolink | LinkType::Email => {
                         writer.write_str("<")?;
                     }
                     _ => {
@@ -568,7 +571,7 @@ where
             } else if let Event::End(Tag::Link(kind, target, _)) = event {
                 // FIXME
                 match kind {
-                    LinkType::Autolink => {
+                    LinkType::Autolink | LinkType::Email => {
                         writer.write_str(">")?;
                     }
                     _ => {
@@ -582,10 +585,15 @@ where
                 // FIXME
                 writer.write_str("![")?;
                 let _ = iter.next();
-            } else if let Event::End(Tag::Image(_, target, _)) = event {
+            } else if let Event::End(Tag::Image(_, target, title)) = event {
                 // FIXME
                 writer.write_str("](")?;
                 writer.write_str(target)?;
+                if !title.is_empty() {
+                    writer.write_str(" \"")?;
+                    writer.write_str(title)?;
+                    writer.write_str("\"")?;
+                }
                 writer.write_str(")")?;
                 let _ = iter.next();
             } else {
