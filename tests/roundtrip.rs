@@ -1,7 +1,7 @@
 #![cfg(feature = "roundtrip")]
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
 use pulldown_cmark::roundtrip::write_markdown;
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
 
 const COMMONMARK_SPEC_TEXT: &'static str = include_str!("../third_party/CommonMark/spec.txt");
 
@@ -67,13 +67,17 @@ fn test_roundtrip(original: &str, expected: &str) -> bool {
         return true;
     }
     eprintln!(
-        "Test fail: event [{}/{}] is {:?} vs {:?}\nExpected full output:\n{}",
+        "Test fail: event [{}/{}] is {:?} vs {:?}",
         same_event_count,
         event_count,
         event_list.get(same_event_count),
         event_list_2.get(same_event_count),
-        expected
     );
+    eprintln!("Original input: \n{}", original);
+    eprintln!("Regenerated markdown: \n{}", regen_str);
+    eprintln!("Expected token list: \n{:?}", event_list);
+    eprintln!("Actual token list: \n{:?}", event_list_2);
+    eprintln!("Expected full output:\n{}", expected);
     return false;
 }
 
