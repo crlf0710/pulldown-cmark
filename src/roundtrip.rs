@@ -1,7 +1,9 @@
 #![allow(dead_code, unused_mut)]
 use crate::escape::{StrWrite, WriteWrapper};
+use crate::CowStr;
 use crate::{CodeBlockKind, LinkType};
 use crate::{Event, Tag};
+use std::collections::VecDeque;
 use std::io::{self, Write};
 
 struct MarkdownWriter<'a, I, W> {
@@ -79,7 +81,7 @@ enum tri_bool {
 fn is_childless_block(event: &Event<'_>) -> tri_bool {
     if matches!(event, Event::Rule) {
         tri_bool::r#true
-    } else if matches!(event, Event::Html(_)) {
+    } else if matches!(event, Event::Html(_) | Event::Text(_)) {
         tri_bool::maybe
     } else {
         tri_bool::r#false
@@ -93,8 +95,50 @@ fn is_childless_block_2(context: &[Event<'_>], event: &Event<'_>) -> bool {
         true
     } else if matches!(event, Event::Html(_)) {
         !context.last().map_or(false, is_leaf_block_start)
+    } else if matches!(event, Event::Text(_)) {
+        if let Some(Event::Start(Tag::Item)) = context.last() {
+            // so called tight list.
+            true
+        } else {
+            false
+        }
     } else {
         false
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct EscapeOptions(usize);
+
+impl EscapeOptions {
+    const ESCAPE_LINEFEED: EscapeOptions = EscapeOptions(1);
+
+    fn has(self, rhs: EscapeOptions) -> bool {
+        self.0 & rhs.0 == rhs.0
+    }
+}
+
+fn escape_text<'a>(input: &CowStr<'a>, options: EscapeOptions) -> CowStr<'a> {
+    let mut rewrite_str = None;
+    let input_str = &*input;
+    for (offset, ch) in input_str.char_indices() {
+        if ch.is_ascii_punctuation() {
+            let rewrite_str = rewrite_str.get_or_insert_with(|| input_str[..offset].to_string());
+            rewrite_str.push('\\');
+            rewrite_str.push(ch);
+        } else if ch == '\n' && options.has(EscapeOptions::ESCAPE_LINEFEED) {
+            let rewrite_str = rewrite_str.get_or_insert_with(|| input_str[..offset].to_string());
+            *rewrite_str += "&#10;";
+        } else {
+            if let Some(rewrite_str) = rewrite_str.as_mut() {
+                rewrite_str.push(ch);
+            }
+        }
+    }
+    if let Some(str) = rewrite_str {
+        str.into()
+    } else {
+        input.clone()
     }
 }
 
@@ -112,8 +156,8 @@ where
     }
 
     fn run(mut self) -> io::Result<()> {
-        let mut stack = vec![];
-        let mut incoming_stack = vec![];
+        let mut stack = Vec::new();
+        let mut incoming_stack = VecDeque::new();
         let mut outgoing_counter = 0;
         let mut iter = self.iter.peekable();
         // In general, we split markdown generation into a sequence of four actions
@@ -165,7 +209,7 @@ where
                     } else if state == 3 {
                         unreachable!();
                     } else {
-                        incoming_stack.push(iter.next().unwrap());
+                        incoming_stack.push_back(iter.next().unwrap());
                     }
                     new_state = 0;
                     continue 'seq;
@@ -173,7 +217,7 @@ where
                     if state == 4 && new_state == 1 {
                         // eprintln!("dbg: prepare transition {} => {}", state, new_state);
                         state = 1;
-                        incoming_stack.push(iter.next().unwrap());
+                        incoming_stack.push_back(iter.next().unwrap());
                         new_state = 0;
                         continue 'seq;
                     } else {
@@ -204,14 +248,30 @@ where
                         &mut self.writer,
                         &stack[0..remaining_stack_len],
                         &stack[remaining_stack_len..],
-                        &incoming_stack,
+                        incoming_stack.make_contiguous(),
                     )?;
+                    stack.drain(remaining_stack_len..);
                 }
-                Self::process_enter_nesting(&mut self.writer, &mut stack, &incoming_stack)?;
-                stack.drain(remaining_stack_len..);
+                Self::process_enter_nesting(&mut self.writer, &mut stack, &mut incoming_stack)?;
                 stack.extend(incoming_stack.drain(..));
             } else if state == 2 {
-                Self::process_nonnesting_sequence(&mut self.writer, &stack, &incoming_stack)?;
+                if let (4, Some(Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))))) =
+                    (new_state, stack.last())
+                {
+                    if let Some(Event::Text(text_str)) = incoming_stack.back_mut() {
+                        // FIXME pulldown_cmark leaves a `\n` here if `new_state` is 4,
+                        // and doesn't leave one here if `new_state` is 0.
+                        // we fix it here to handle it consistently.
+                        if text_str.ends_with('\n') {
+                            *text_str = text_str[..text_str.len() - 1].to_string().into();
+                        }
+                    }
+                }
+                Self::process_nonnesting_sequence(
+                    &mut self.writer,
+                    &stack,
+                    incoming_stack.make_contiguous(),
+                )?;
             } else if state == 3 {
                 unreachable!();
             } else if state == 4 {
@@ -225,20 +285,21 @@ where
             incoming_stack.clear();
             if new_state == 1 || new_state == 2 {
                 outgoing_counter = 0;
-                incoming_stack.push(iter.next().unwrap());
+                incoming_stack.push_back(iter.next().unwrap());
             } else if new_state == 3 {
-                incoming_stack.push(iter.next().unwrap());
+                incoming_stack.push_back(iter.next().unwrap());
                 if state == 4 {
                     let remaining_stack_len = stack.len().checked_sub(outgoing_counter).unwrap();
                     Self::process_transition(
                         &mut self.writer,
                         &stack[0..remaining_stack_len],
                         &stack[remaining_stack_len..],
-                        &incoming_stack,
+                        incoming_stack.make_contiguous(),
                     )?;
+                    stack.drain(remaining_stack_len..);
                 }
                 outgoing_counter = 0;
-                Self::process_enter_nesting(&mut self.writer, &mut stack, &incoming_stack)?;
+                Self::process_enter_nesting(&mut self.writer, &mut stack, &mut incoming_stack)?;
                 stack.extend(incoming_stack.drain(..));
                 outgoing_counter += 1;
                 new_state = 4;
@@ -255,9 +316,9 @@ where
 
     fn process_transition(
         writer: &mut W,
-        context: &[Event<'_>],
-        removing_sequence: &[Event<'_>],
-        added_sequence: &[Event<'_>],
+        context: &[Event<'a>],
+        removing_sequence: &[Event<'a>],
+        added_sequence: &[Event<'a>],
     ) -> io::Result<()> {
         enum TransitionStrategy {
             DoNothing,
@@ -284,6 +345,10 @@ where
                     strategy = Some(TransitionStrategy::ExtraNewlineAndRenew);
                 }
                 ([Event::Html(_)], [Event::Html(_)]) => {
+                    strategy = Some(TransitionStrategy::DoNothing);
+                }
+                ([Event::Text(_)], [Event::Text(_)]) => {
+                    // FIXME: This is the tight list case.
                     strategy = Some(TransitionStrategy::DoNothing);
                 }
                 _ => {}
@@ -316,226 +381,244 @@ where
             }
             TransitionStrategy::NewlineAndRenew => {
                 writer.write_str("\n")?;
-                Self::renew_nonnesting_sequence_line_start(writer, context)?;
+                Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
             }
             TransitionStrategy::ExtraNewlineAndRenew => {
                 writer.write_str("\n")?;
-                Self::renew_nonnesting_sequence_line_start(writer, context)?;
+                Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
                 writer.write_str("\n")?;
-                Self::renew_nonnesting_sequence_line_start(writer, context)?;
+                Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
             }
         }
         Ok(())
     }
     fn process_enter_nesting(
         writer: &mut W,
-        context: &mut [Event<'_>],
-        sequence: &[Event<'_>],
+        context: &mut Vec<Event<'a>>,
+        sequence: &mut VecDeque<Event<'a>>,
     ) -> io::Result<()> {
-        if sequence.is_empty() {
-            return Ok(());
-        }
-        if let [Event::Rule] = sequence {
-            writer.write_str("***")?;
-        } else if let [Event::Html(html_text)] = sequence {
-            writer.write_str(&**html_text)?;
-        } else if let [Event::Start(tag)] = sequence {
-            match tag {
-                Tag::Paragraph => {
-                    // do nothing,
+        while let Some(event) = sequence.pop_front() {
+            match &event {
+                Event::Rule => {
+                    if let Some(Event::Start(Tag::Item)) = context.last() {
+                        writer.write_str("---")?;
+                    } else {
+                        writer.write_str("***")?;
+                    }
                 }
-                Tag::Heading(level) => {
-                    let level_str = &"#######"[..(*level) as usize];
-                    writer.write_str(level_str)?;
-                    writer.write_str(" ")?;
+                Event::Html(html_text) => {
+                    writer.write_str(&**html_text)?;
+                    if html_text.ends_with("\n") {
+                        Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
+                    }
                 }
-                Tag::BlockQuote => {
-                    writer.write_str("> ")?;
+                Event::Text(text) => {
+                    if let Some(Event::Start(Tag::CodeBlock(_))) = context.last() {
+                        writer.write_str(&**text)?;
+                    } else {
+                        writer.write_str(&*escape_text(text, EscapeOptions::default()))?;
+                    }
                 }
-                Tag::CodeBlock(CodeBlockKind::Indented) => {
-                    writer.write_str("    ")?;
-                }
-                Tag::CodeBlock(CodeBlockKind::Fenced(str)) => {
-                    writer.write_str("````")?;
-                    writer.write_str(str)?;
-                    writer.write_str("\n")?;
-                }
-                Tag::Item => match context.last_mut() {
-                    Some(Event::Start(Tag::List(style))) => {
-                        if let Some(idx) = style {
-                            *idx += 1;
-                            let str = format!("{}. ", idx);
-                            writer.write_str(&str)?;
-                        } else {
-                            writer.write_str("* ")?;
+                Event::Start(tag) => {
+                    match tag {
+                        Tag::Paragraph | Tag::List(_) => {
+                            // do nothing,
+                        }
+                        Tag::Heading(level) => {
+                            let level_str = &"#######"[..(*level) as usize];
+                            writer.write_str(level_str)?;
+                            writer.write_str(" ")?;
+                        }
+                        Tag::BlockQuote => {
+                            writer.write_str("> ")?;
+                        }
+                        Tag::CodeBlock(CodeBlockKind::Indented) => {
+                            writer.write_str("    ")?;
+                        }
+                        Tag::CodeBlock(CodeBlockKind::Fenced(str)) => {
+                            writer.write_str("````")?;
+                            writer.write_str(str)?;
+                            writer.write_str("\n")?;
+                            Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
+                        }
+                        Tag::Item => match context.last_mut() {
+                            Some(Event::Start(Tag::List(style))) => {
+                                if let Some(idx) = style {
+                                    let str = format!("{}. ", idx);
+                                    writer.write_str(&str)?;
+                                    *idx += 1;
+                                } else {
+                                    writer.write_str("* ")?;
+                                }
+                            }
+                            _ => {
+                                eprintln!(
+                                    "item encountered but list context not found: {:?}",
+                                    context
+                                );
+                            }
+                        },
+                        _ => {
+                            eprintln!(
+                                "unhandled enter nesting event {:?}, remaining: {:?}",
+                                event, sequence
+                            );
                         }
                     }
-                    _ => {
-                        eprintln!("item encountered but list context not found: {:?}", context);
-                    }
-                },
-                _ => {
-                    eprintln!("unhandled enter nesting event {:?}", sequence);
-                }
-            }
-        } else if let [Event::Start(tag1), Event::Start(tag2)] = sequence {
-            match (tag1, tag2) {
-                (Tag::List(None), Tag::Item) => {
-                    writer.write_str("* ")?;
-                }
-                (Tag::List(Some(idx)), Tag::Item) => {
-                    let str = format!("{}. ", idx);
-                    writer.write_str(&str)?;
-                }
-                (Tag::BlockQuote, Tag::Paragraph) => {
-                    writer.write_str("> ")?;
-                }
-                (Tag::BlockQuote, Tag::Heading(level)) => {
-                    writer.write_str("> ")?;
-                    let level_str = &"#######"[..(*level) as usize];
-                    writer.write_str(level_str)?;
-                    writer.write_str(" ")?;
-                }
-                (Tag::Item, Tag::Paragraph) => match context.last_mut() {
-                    Some(Event::Start(Tag::List(style))) => {
-                        if let Some(idx) = style {
-                            *idx += 1;
-                            let str = format!("{}. ", idx);
-                            writer.write_str(&str)?;
-                        } else {
-                            writer.write_str("* ")?;
-                        }
-                    }
-                    _ => {
-                        eprintln!("item encountered but list context not found: {:?}", context);
-                    }
-                },
-                _ => {
-                    eprintln!("unhandled enter nesting event {:?}", sequence);
-                }
-            }
-        } else if let [Event::Start(tag1), Event::Start(tag2), Event::Start(tag3)] = sequence {
-            match (tag1, tag2, tag3) {
-                (Tag::List(None), Tag::Item, Tag::Paragraph) => {
-                    writer.write_str("* ")?;
                 }
                 _ => {
-                    eprintln!("unhandled enter nesting event {:?}", sequence);
+                    eprintln!(
+                        "unhandled enter nesting event {:?}, remaining: {:?}",
+                        event, sequence
+                    );
                 }
             }
-        } else {
-            eprintln!("unhandled enter nesting event {:?}", sequence);
+            context.push(event);
         }
         Ok(())
     }
     fn process_exit_nesting(
         writer: &mut W,
-        _context: &[Event<'_>],
-        sequence: &[Event<'_>],
+        context: &[Event<'a>],
+        sequence: &[Event<'a>],
     ) -> io::Result<()> {
-        if sequence.is_empty() {
-            return Ok(());
-        }
-        if let [Event::Start(tag)] = sequence {
-            match tag {
-                Tag::Paragraph => {
+        for idx in (0..sequence.len()).rev() {
+            let event = &sequence[idx];
+            let remaining_sequence = &sequence[0..idx];
+            match event {
+                Event::Rule => {
                     // do nothing
                 }
-                Tag::CodeBlock(CodeBlockKind::Indented) => {
+                Event::Html(_) => {
                     // do nothing
                 }
-                Tag::CodeBlock(CodeBlockKind::Fenced(_)) => {
-                    writer.write_str("````")?;
+                Event::Text(_) => {
+                    // do nothing
+                    // FIXME: This is the tight list case.
+                }
+                Event::Start(tag) => {
+                    match tag {
+                        Tag::Paragraph
+                        | Tag::Heading(_)
+                        | Tag::BlockQuote
+                        | Tag::Item
+                        | Tag::List(_) => {
+                            // do nothing
+                        }
+                        Tag::CodeBlock(CodeBlockKind::Indented) => {
+                            // do nothing
+                        }
+                        Tag::CodeBlock(CodeBlockKind::Fenced(_)) => {
+                            writer.write_str("\n")?;
+                            Self::renew_nonnesting_sequence_line_start(
+                                writer,
+                                context,
+                                remaining_sequence,
+                            )?;
+                            writer.write_str("````")?;
+                        }
+                        _ => {
+                            eprintln!("unhandled exit nesting event {:?}", sequence);
+                        }
+                    }
                 }
                 _ => {
                     eprintln!("unhandled exit nesting event {:?}", sequence);
                 }
             }
-        } else {
-            eprintln!("unhandled exit nesting event {:?}", sequence);
         }
         Ok(())
     }
     fn renew_nonnesting_sequence_line_start(
         writer: &mut W,
-        context: &[Event<'_>],
+        context: &[Event<'a>],
+        context2: &[Event<'a>],
     ) -> io::Result<()> {
-        if context.is_empty() {
-            return Ok(());
-        }
-        if let [Event::Start(tag)] = context {
-            match tag {
-                Tag::Paragraph => {
-                    // do nothing,
+        let mut remaining_context = context.iter().chain(context2.iter()).peekable();
+        while let Some(event) = remaining_context.next() {
+            match event {
+                Event::Start(tag) => {
+                    match tag {
+                        Tag::Paragraph => {
+                            // do nothing
+                        }
+                        Tag::Heading(_) => {
+                            eprintln!("unhandled renew context at new line {:?}", context);
+                        }
+                        Tag::CodeBlock(CodeBlockKind::Indented) => {
+                            writer.write_str("    ")?;
+                        }
+                        Tag::CodeBlock(CodeBlockKind::Fenced(_)) => {
+                            // do nothing
+                        }
+                        Tag::BlockQuote => {
+                            writer.write_str("> ")?;
+                        }
+                        Tag::List(None) => {
+                            if let Some(Event::Start(Tag::Item)) = remaining_context.peek() {
+                                let _ = remaining_context.next();
+                                writer.write_str("  ")?;
+                            }
+                        }
+                        Tag::List(Some(idx)) => {
+                            if let Some(Event::Start(Tag::Item)) = remaining_context.peek() {
+                                let _ = remaining_context.next();
+                                let str = format!("{}. ", idx - 1)
+                                    .chars()
+                                    .map(|_| ' ')
+                                    .collect::<String>();
+                                writer.write_str(&str)?;
+                            }
+                        }
+                        Tag::Item => {
+                            unreachable!();
+                        }
+                        _ => {
+                            eprintln!("unhandled renew context at new line {:?}", context);
+                        }
+                    }
                 }
-                Tag::CodeBlock(CodeBlockKind::Indented) => {
-                    writer.write_str("    ")?;
-                }
-                Tag::BlockQuote => {
-                    writer.write_str("> ")?;
-                }
-                Tag::List(None) => {
-                    writer.write_str("  ")?;
+                Event::Text(_) => {
+                    // do nothing
                 }
                 _ => {
                     eprintln!("unhandled renew context at new line {:?}", context);
                 }
             }
-        } else if let [Event::Start(tag1), Event::Start(tag2)] = context {
-            match (tag1, tag2) {
-                (Tag::List(None), Tag::Item) => {
-                    writer.write_str("  ")?;
-                }
-                (Tag::List(Some(idx)), Tag::Item) => {
-                    let str = format!("{}. ", idx)
-                        .chars()
-                        .map(|_| ' ')
-                        .collect::<String>();
-                    writer.write_str(&str)?;
-                }
-                (Tag::BlockQuote, Tag::Paragraph) => {
-                    writer.write_str("> ")?;
-                }
-                _ => {
-                    eprintln!("unhandled renew context at new line {:?}", context);
-                }
-            }
-        } else if let [Event::Start(tag1), Event::Start(tag2), Event::Start(tag3), Event::Start(tag4)] =
-            context
-        {
-            match (tag1, tag2, tag3, tag4) {
-                (Tag::List(None), Tag::Item, Tag::List(None), Tag::Item) => {
-                    writer.write_str("    ")?;
-                }
-                _ => {
-                    eprintln!("unhandled renew context at new line {:?}", context);
-                }
-            }
-        } else {
-            eprintln!("unhandled renew context at new line {:?}", context);
         }
         Ok(())
     }
     fn process_nonnesting_sequence(
         writer: &mut W,
-        context: &[Event<'_>],
-        sequence: &[Event<'_>],
+        context: &[Event<'a>],
+        sequence: &[Event<'a>],
     ) -> io::Result<()> {
         let mut iter = sequence.iter().peekable();
         while let Some(event) = iter.peek() {
             if let Event::Text(text) = event {
-                writer.write_str(&**text)?;
+                if let Some(Event::Start(Tag::CodeBlock(_))) = context.last() {
+                    writer.write_str(&**text)?;
+                } else if let Some(Event::Start(Tag::Heading(_))) = context.last() {
+                    writer.write_str(&*escape_text(text, EscapeOptions::ESCAPE_LINEFEED))?;
+                } else {
+                    writer.write_str(&*escape_text(text, EscapeOptions::default()))?;
+                }
                 if text.ends_with("\n") {
-                    Self::renew_nonnesting_sequence_line_start(writer, context)?;
+                    Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
                 }
                 let _ = iter.next();
             } else if let Event::SoftBreak = event {
-                writer.write_str("\n")?;
-                Self::renew_nonnesting_sequence_line_start(writer, context)?;
+                if let Some(Event::Start(Tag::Heading(_))) = context.last() {
+                    writer
+                        .write_str(&*escape_text(&'\n'.into(), EscapeOptions::ESCAPE_LINEFEED))?;
+                } else {
+                    writer.write_str("\n")?;
+                    Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
+                }
                 let _ = iter.next();
             } else if let Event::HardBreak = event {
                 writer.write_str("\\\n")?;
-                Self::renew_nonnesting_sequence_line_start(writer, context)?;
+                Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
                 let _ = iter.next();
             } else if let Event::Code(str) = event {
                 writer.write_str("`")?;
@@ -543,10 +626,10 @@ where
                 writer.write_str("`")?;
                 let _ = iter.next();
             } else if let Event::Start(Tag::Emphasis) = event {
-                writer.write_str("_")?;
+                writer.write_str("*")?;
                 let _ = iter.next();
             } else if let Event::End(Tag::Emphasis) = event {
-                writer.write_str("_")?;
+                writer.write_str("*")?;
                 let _ = iter.next();
             } else if let Event::Start(Tag::Strong) = event {
                 writer.write_str("**")?;
@@ -568,7 +651,7 @@ where
                     }
                 }
                 let _ = iter.next();
-            } else if let Event::End(Tag::Link(kind, target, _)) = event {
+            } else if let Event::End(Tag::Link(kind, target, title)) = event {
                 // FIXME
                 match kind {
                     LinkType::Autolink | LinkType::Email => {
@@ -577,6 +660,11 @@ where
                     _ => {
                         writer.write_str("](")?;
                         writer.write_str(target)?;
+                        if !title.is_empty() {
+                            writer.write_str(" \"")?;
+                            writer.write_str(title)?;
+                            writer.write_str("\"")?;
+                        }
                         writer.write_str(")")?;
                     }
                 }

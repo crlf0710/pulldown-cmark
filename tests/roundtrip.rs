@@ -1,7 +1,9 @@
 #![cfg(feature = "roundtrip")]
 
+use std::borrow::Cow;
 use pulldown_cmark::roundtrip::write_markdown;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+use pulldown_cmark::CowStr;
 
 const COMMONMARK_SPEC_TEXT: &'static str = include_str!("../third_party/CommonMark/spec.txt");
 
@@ -49,6 +51,64 @@ fn collect_test_case<'a>(events: &mut impl Iterator<Item = Event<'a>>) -> Option
     Some((input.to_string(), output.to_string()))
 }
 
+struct EventSeqCanoncalizer<'a, 'b, I>
+where
+    I: Iterator<Item = &'b Event<'a>>,
+    'a: 'b
+{
+    iter: core::iter::Peekable<I>,
+    phantom: core::marker::PhantomData<&'b &'a ()>,
+}
+
+impl<'a, 'b: 'a, I> Iterator for EventSeqCanoncalizer<'a, 'b, I>
+where
+    I: Iterator<Item = &'b Event<'a>>,
+    'a: 'b
+{
+    type Item = Cow<'b, Event<'a>>;
+    fn next(&mut self) -> Option<<Self as Iterator>::Item> {
+        fn is_text(event: &&Event<'_>) -> bool {
+            matches!(event, Event::Text(_))
+        }
+
+        fn get_text<'a, 'b>(event: &'b Event<'a>) -> &'b CowStr<'a> {
+            if let Event::Text(v) = event {
+                v
+            } else {
+                unreachable!()
+            }
+        }
+        if let Some(text) = self.iter.next_if(is_text) {
+            let mut joining_text = get_text(&text).to_string();
+            while let Some(more_text) = self.iter.next_if(is_text) {
+                joining_text += &*get_text(&more_text);
+            }
+            Some(Cow::Owned(Event::Text(joining_text.into())))
+        } else {
+            self.iter.next().map(Cow::Borrowed)
+        }
+    }
+}
+
+trait IteratorExt<'a, 'b>: Iterator<Item = &'b Event<'a>> where 'a: 'b {
+    fn canonicalize(self) -> EventSeqCanoncalizer<'a, 'b, Self>
+    where
+        Self: Sized;
+}
+
+impl<'a, 'b, T> IteratorExt<'a, 'b> for T
+where
+    T: Iterator<Item = &'b Event<'a>>,
+    'a: 'b
+{
+    fn canonicalize(self) -> EventSeqCanoncalizer<'a, 'b, Self> {
+        EventSeqCanoncalizer {
+            iter: self.peekable(),
+            phantom: core::marker::PhantomData,
+        }
+    }
+}
+
 fn test_roundtrip(original: &str, expected: &str) -> bool {
     let opts = Options::empty();
     let event_list = Parser::new_ext(original, opts).collect::<Vec<_>>();
@@ -56,11 +116,15 @@ fn test_roundtrip(original: &str, expected: &str) -> bool {
     write_markdown(&mut regen_str, event_list.iter().cloned()).expect("Regeneration failure");
     let regen_str = core::str::from_utf8(&regen_str).expect("Should be utf-8");
     let event_list_2 = Parser::new_ext(&regen_str, opts).collect::<Vec<_>>();
-    let event_count = event_list.len();
-    let event_count_2 = event_list_2.len();
+    if event_list.iter().canonicalize().eq(event_list_2.iter().canonicalize()) {
+        return true;
+    }
+    let event_count = event_list.iter().canonicalize().count();
+    let event_count_2 = event_list_2.iter().canonicalize().count();
     let same_event_count = event_list
         .iter()
-        .zip(event_list_2.iter())
+        .canonicalize()
+        .zip(event_list_2.iter().canonicalize())
         .take_while(|(e1, e2)| e1 == e2)
         .count();
     if event_count == same_event_count && event_count_2 == same_event_count {
@@ -70,8 +134,8 @@ fn test_roundtrip(original: &str, expected: &str) -> bool {
         "Test fail: event [{}/{}] is {:?} vs {:?}",
         same_event_count,
         event_count,
-        event_list.get(same_event_count),
-        event_list_2.get(same_event_count),
+        event_list.iter().canonicalize().nth(same_event_count),
+        event_list_2.iter().canonicalize().nth(same_event_count),
     );
     eprintln!("Original input: \n{}", original);
     eprintln!("Regenerated markdown: \n{}", regen_str);
