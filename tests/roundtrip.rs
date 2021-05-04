@@ -57,6 +57,7 @@ where
     'a: 'b
 {
     iter: core::iter::Peekable<I>,
+    converting_thin_list_to_nonthin: Vec<usize>,
     phantom: core::marker::PhantomData<&'b &'a ()>,
 }
 
@@ -71,6 +72,14 @@ where
             matches!(event, Event::Text(_))
         }
 
+        fn is_item_start(event: &&Event<'_>) -> bool {
+            matches!(event, Event::Start(Tag::Item))
+        }
+
+        fn is_item_end(event: &&Event<'_>) -> bool {
+            matches!(event, Event::End(Tag::Item))
+        }
+
         fn get_text<'a, 'b>(event: &'b Event<'a>) -> &'b CowStr<'a> {
             if let Event::Text(v) = event {
                 v
@@ -78,12 +87,32 @@ where
                 unreachable!()
             }
         }
-        if let Some(text) = self.iter.next_if(is_text) {
+        if let Some(1) = self.converting_thin_list_to_nonthin.last() {
+            self.converting_thin_list_to_nonthin.pop();
+            self.converting_thin_list_to_nonthin.push(2);
+            Some(Cow::Owned(Event::Start(Tag::Paragraph)))
+        } else if let Some(text) = self.iter.next_if(is_text) {
             let mut joining_text = get_text(&text).to_string();
             while let Some(more_text) = self.iter.next_if(is_text) {
                 joining_text += &*get_text(&more_text);
             }
             Some(Cow::Owned(Event::Text(joining_text.into())))
+        } else if let Some(item_start) = self.iter.next_if(is_item_start) {
+            if self.iter.peek().map(is_text).unwrap_or(false) {
+                self.converting_thin_list_to_nonthin.push(1);
+            } else {
+                self.converting_thin_list_to_nonthin.push(0);
+            }
+            Some(Cow::Borrowed(item_start))
+        } else if self.iter.peek().map(is_item_end).unwrap_or(false) {
+            if let Some(2) = self.converting_thin_list_to_nonthin.last() {
+                self.converting_thin_list_to_nonthin.pop();
+                self.converting_thin_list_to_nonthin.push(0);
+                Some(Cow::Owned(Event::End(Tag::Paragraph)))
+            } else {
+                self.converting_thin_list_to_nonthin.pop();
+                self.iter.next().map(Cow::Borrowed)
+            }
         } else {
             self.iter.next().map(Cow::Borrowed)
         }
@@ -104,6 +133,7 @@ where
     fn canonicalize(self) -> EventSeqCanoncalizer<'a, 'b, Self> {
         EventSeqCanoncalizer {
             iter: self.peekable(),
+            converting_thin_list_to_nonthin: Vec::new(),
             phantom: core::marker::PhantomData,
         }
     }

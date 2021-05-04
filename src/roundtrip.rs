@@ -141,6 +141,29 @@ fn escape_url<'a>(input: &CowStr<'a>) -> CowStr<'a> {
     result_str.into()
 }
 
+fn generate_reference_name(idx_end: usize) -> String {
+    format!("$_ref_at_{}$", idx_end)
+}
+
+fn find_end_tag_position_for_start_tag(
+    sequence: &[Event<'_>],
+    start_tag_idx: usize,
+) -> Option<usize> {
+    // FIXME: Properly handle nesting.
+    if let Event::Start(start_tag) = &sequence[start_tag_idx] {
+        for end_tag_idx in start_tag_idx + 1..sequence.len() {
+            if let Event::End(end_tag) = &sequence[end_tag_idx] {
+                if start_tag == end_tag {
+                    return Some(end_tag_idx);
+                }
+            }
+        }
+        None
+    } else {
+        None
+    }
+}
+
 #[derive(Default)]
 struct EmphStrongState {
     event_idx: usize,
@@ -639,12 +662,13 @@ where
                             match context.last_mut() {
                                 Some(Event::Start(Tag::List(style))) => {
                                     if let Some(idx) = style {
-                                        let str =
-                                            if !shared_state.is_list_style_flipped(context_len - 1) {
-                                                format!("{}. ", idx)
-                                            } else {
-                                                format!("{}) ", idx)
-                                            };
+                                        let str = if !shared_state
+                                            .is_list_style_flipped(context_len - 1)
+                                        {
+                                            format!("{}. ", idx)
+                                        } else {
+                                            format!("{}) ", idx)
+                                        };
                                         writer.write_str(&str)?;
                                         *idx += 1;
                                     } else {
@@ -793,14 +817,80 @@ where
         }
         Ok(())
     }
-    fn process_nonnesting_sequence(
+    fn process_definition_and_references(
         writer: &mut W,
         context: &[Event<'a>],
         sequence: &[Event<'a>],
+        resolution: &Vec<EmphStrongState>,
     ) -> io::Result<()> {
+        // we need to "hoist" all definitions and references to first.
         let mut iter = sequence.iter().enumerate().peekable();
+        while let Some((idx, event)) = iter.peek() {
+            if let Event::Start(Tag::Link(link_type, target, title))
+            | Event::Start(Tag::Image(link_type, target, title)) = event
+            {
+                if !matches!(
+                    link_type,
+                    LinkType::Collapsed | LinkType::Shortcut | LinkType::Reference
+                ) {
+                    let _ = iter.next();
+                    continue;
+                }
 
-        let resolution = resolve_emphasis_and_strong(sequence);
+                let range_end = match find_end_tag_position_for_start_tag(sequence, *idx) {
+                    Some(end_idx) => end_idx,
+                    None => {
+                        let _ = iter.next();
+                        continue;
+                    }
+                };
+                let range_start = idx + 1;
+                writer.write_str("[")?;
+                match link_type {
+                    LinkType::Collapsed | LinkType::Shortcut => {
+                        Self::process_inlines(
+                            writer,
+                            context,
+                            sequence,
+                            range_start..range_end,
+                            resolution,
+                        )?;
+                    }
+                    LinkType::Reference => {
+                        let reference_name = generate_reference_name(range_end);
+                        writer.write_str(&reference_name)?;
+                    }
+                    _ => {
+                        unreachable!();
+                    }
+                }
+                writer.write_str("]: ")?;
+                writer.write_str(&*escape_url(target))?;
+                if !title.is_empty() {
+                    writer.write_str(" \"")?;
+                    writer.write_str(&*escape_text(&title, EscapeOptions::default()))?;
+                    writer.write_str("\"")?;
+                }
+                writer.write_str("\n")?;
+                Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
+            }
+            let _ = iter.next();
+        }
+        Ok(())
+    }
+    fn process_inlines(
+        writer: &mut W,
+        context: &[Event<'a>],
+        sequence: &[Event<'a>],
+        range: core::ops::Range<usize>,
+        resolution: &Vec<EmphStrongState>,
+    ) -> io::Result<()> {
+        let mut iter = sequence
+            .iter()
+            .enumerate()
+            .skip(range.start)
+            .take(range.len())
+            .peekable();
         while let Some((event_idx, event)) = iter.peek() {
             if let Event::Text(text) = event {
                 if let Some(Event::Start(Tag::CodeBlock(_))) = context.last() {
@@ -876,7 +966,6 @@ where
                 writer.write_str(&**html_str)?;
                 let _ = iter.next();
             } else if let Event::Start(Tag::Link(kind, _, _)) = event {
-                // FIXME
                 match kind {
                     LinkType::Autolink | LinkType::Email => {
                         writer.write_str("<")?;
@@ -901,7 +990,6 @@ where
                 }
                 let _ = iter.next();
             } else if let Event::End(Tag::Link(kind, target, title)) = event {
-                // FIXME
                 match kind {
                     LinkType::Autolink => {
                         unreachable!();
@@ -909,12 +997,24 @@ where
                     LinkType::Email => {
                         unreachable!();
                     }
+                    LinkType::Collapsed => {
+                        writer.write_str("][]")?;
+                    }
+                    LinkType::Shortcut => {
+                        writer.write_str("]")?;
+                    }
+                    LinkType::Reference => {
+                        writer.write_str("][")?;
+                        let reference_name = generate_reference_name(*event_idx);
+                        writer.write_str(&reference_name)?;
+                        writer.write_str("]")?;
+                    }
                     _ => {
                         writer.write_str("](")?;
                         writer.write_str(&*escape_url(target))?;
                         if !title.is_empty() {
                             writer.write_str(" \"")?;
-                            writer.write_str(title)?;
+                            writer.write_str(&*escape_text(&title, EscapeOptions::default()))?;
                             writer.write_str("\"")?;
                         }
                         writer.write_str(")")?;
@@ -922,25 +1022,49 @@ where
                 }
                 let _ = iter.next();
             } else if let Event::Start(Tag::Image(_, _, _)) = event {
-                // FIXME
                 writer.write_str("![")?;
                 let _ = iter.next();
-            } else if let Event::End(Tag::Image(_, target, title)) = event {
-                // FIXME
-                writer.write_str("](")?;
-                writer.write_str(&*escape_url(target))?;
-                if !title.is_empty() {
-                    writer.write_str(" \"")?;
-                    writer.write_str(title)?;
-                    writer.write_str("\"")?;
+            } else if let Event::End(Tag::Image(kind, target, title)) = event {
+                match kind {
+                    LinkType::Collapsed => {
+                        writer.write_str("][]")?;
+                    }
+                    LinkType::Shortcut => {
+                        writer.write_str("]")?;
+                    }
+                    LinkType::Reference => {
+                        writer.write_str("][")?;
+                        let reference_name = generate_reference_name(*event_idx);
+                        writer.write_str(&reference_name)?;
+                        writer.write_str("]")?;
+                    }
+                    _ => {
+                        writer.write_str("](")?;
+                        writer.write_str(&*escape_url(target))?;
+                        if !title.is_empty() {
+                            writer.write_str(" \"")?;
+                            writer.write_str(&*escape_text(&title, EscapeOptions::default()))?;
+                            writer.write_str("\"")?;
+                        }
+                        writer.write_str(")")?;
+                    }
                 }
-                writer.write_str(")")?;
                 let _ = iter.next();
             } else {
                 eprintln!("unhandled output event {:?}", event);
                 let _ = iter.next();
             }
         }
+        Ok(())
+    }
+    fn process_nonnesting_sequence(
+        writer: &mut W,
+        context: &[Event<'a>],
+        sequence: &[Event<'a>],
+    ) -> io::Result<()> {
+        let resolution = resolve_emphasis_and_strong(sequence);
+        Self::process_definition_and_references(writer, context, sequence, &resolution)?;
+        Self::process_inlines(writer, context, sequence, 0..sequence.len(), &resolution)?;
         Ok(())
     }
 }
