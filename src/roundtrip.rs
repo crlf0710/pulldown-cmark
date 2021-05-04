@@ -6,16 +6,6 @@ use crate::{Event, Tag};
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
-struct MarkdownWriter<'a, I, W> {
-    /// Iterator supplying events.
-    iter: I,
-
-    /// Writer to write to.
-    writer: W,
-
-    phantom: core::marker::PhantomData<&'a ()>,
-}
-
 fn is_block_tag(tag: &Tag<'_>) -> bool {
     matches!(
         tag,
@@ -111,7 +101,7 @@ fn is_childless_block_2(context: &[Event<'_>], event: &Event<'_>) -> bool {
 struct EscapeOptions(usize);
 
 impl EscapeOptions {
-    const ESCAPE_LINEFEED: EscapeOptions = EscapeOptions(1);
+    const NO_ESCAPE_ASCII_CONTROL: EscapeOptions = EscapeOptions(1);
 
     fn has(self, rhs: EscapeOptions) -> bool {
         self.0 & rhs.0 == rhs.0
@@ -126,9 +116,10 @@ fn escape_text<'a>(input: &CowStr<'a>, options: EscapeOptions) -> CowStr<'a> {
             let rewrite_str = rewrite_str.get_or_insert_with(|| input_str[..offset].to_string());
             rewrite_str.push('\\');
             rewrite_str.push(ch);
-        } else if ch == '\n' && options.has(EscapeOptions::ESCAPE_LINEFEED) {
+        } else if ch.is_ascii_control() && !options.has(EscapeOptions::NO_ESCAPE_ASCII_CONTROL) {
             let rewrite_str = rewrite_str.get_or_insert_with(|| input_str[..offset].to_string());
-            *rewrite_str += "&#10;";
+            let str = format!("&#{};", ch as usize);
+            *rewrite_str += &str;
         } else {
             if let Some(rewrite_str) = rewrite_str.as_mut() {
                 rewrite_str.push(ch);
@@ -140,6 +131,146 @@ fn escape_text<'a>(input: &CowStr<'a>, options: EscapeOptions) -> CowStr<'a> {
     } else {
         input.clone()
     }
+}
+
+fn escape_url<'a>(input: &CowStr<'a>) -> CowStr<'a> {
+    let mut result_str = String::new();
+    result_str += "<";
+    result_str += &**input;
+    result_str += ">";
+    result_str.into()
+}
+
+#[derive(Default)]
+struct EmphStrongState {
+    event_idx: usize,
+    opening_idx: Option<usize>,
+    constraint: EmphStrongConstraint,
+    resolution: EmphStrongResolution,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+struct EmphStrongConstraint(usize);
+
+impl EmphStrongConstraint {
+    const IS_STRONG: EmphStrongConstraint = EmphStrongConstraint(1);
+    const CONSISTENT_WITH_OPENING: EmphStrongConstraint = EmphStrongConstraint(2);
+    const MUST_BE_DIFFERENT_FROM_PREV_SIBLING: EmphStrongConstraint = EmphStrongConstraint(4);
+    const CANT_USE_ASTERISK_AT_LINE_START: EmphStrongConstraint = EmphStrongConstraint(8);
+
+    const FOLLOWED_BY_WHITESPACE: EmphStrongConstraint = EmphStrongConstraint(1024);
+    const FOLLOWED_BY_PUNCTUATION: EmphStrongConstraint = EmphStrongConstraint(2048);
+    const FOLLOWED_BY_DELIMITER: EmphStrongConstraint = EmphStrongConstraint(4096);
+    const PRECEDED_BY_WHITESPACE: EmphStrongConstraint = EmphStrongConstraint(8192);
+    const PRECEDED_BY_PUNCTUATION: EmphStrongConstraint = EmphStrongConstraint(16384);
+    const PRECEDED_BY_DELIMITER: EmphStrongConstraint = EmphStrongConstraint(32768);
+
+    fn has(mut self, rhs: Self) -> bool {
+        self &= rhs;
+        self == rhs
+    }
+}
+
+impl core::ops::BitAndAssign for EmphStrongConstraint {
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.0 &= rhs.0;
+    }
+}
+
+impl core::ops::BitOrAssign for EmphStrongConstraint {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct EmphStrongResolution {
+    is_opening: bool,
+    is_strong: bool,
+    use_underscore: bool,
+    fallback_fix: bool,
+}
+
+fn resolve_emphasis_and_strong(sequence: &[Event<'_>]) -> Vec<EmphStrongState> {
+    let mut resolution_states = Vec::new();
+    for idx in 0..sequence.len() {
+        let (is_opening, is_strong) = match &sequence[idx] {
+            Event::Start(Tag::Emphasis) => (true, false),
+            Event::Start(Tag::Strong) => (true, true),
+            Event::End(Tag::Emphasis) => (false, false),
+            Event::End(Tag::Strong) => (false, true),
+            _ => continue,
+        };
+        let mut constraint = EmphStrongConstraint::default();
+        if is_strong {
+            constraint |= EmphStrongConstraint::IS_STRONG;
+        }
+        let state = EmphStrongState {
+            event_idx: idx,
+            constraint,
+            ..Default::default()
+        };
+        resolution_states.push(state);
+    }
+    for allow_inaccurate in &[false, true] {
+        for state in &mut resolution_states {
+            state.resolution.use_underscore = false;
+            state.resolution.is_strong = state.constraint.has(EmphStrongConstraint::IS_STRONG);
+        }
+    }
+    resolution_states
+}
+
+#[derive(Default, Debug)]
+struct SharedState {
+    flipped_list_style_stack: Vec<usize>,
+    flipped_list_style_stack_truncate_pos: usize,
+}
+
+impl SharedState {
+    fn flip_list_style(&mut self, stack_depth: usize) {
+        if let Some(prev_flipped_list_style_idx) = self.flipped_list_style_stack.last_mut() {
+            debug_assert!(*prev_flipped_list_style_idx <= stack_depth);
+            if *prev_flipped_list_style_idx == stack_depth {
+                self.flipped_list_style_stack.pop();
+            } else {
+                self.flipped_list_style_stack.push(stack_depth);
+            }
+        } else {
+            self.flipped_list_style_stack.push(stack_depth);
+        }
+    }
+    fn is_list_style_flipped(&self, stack_depth: usize) -> bool {
+        self.flipped_list_style_stack
+            .binary_search(&stack_depth)
+            .is_ok()
+    }
+
+    fn flip_list_style_truncate_pos(&self) -> usize {
+        self.flipped_list_style_stack_truncate_pos
+    }
+    fn set_flip_list_style_truncate_pos(&mut self, new_stack_depth: usize) {
+        self.flipped_list_style_stack_truncate_pos = new_stack_depth;
+    }
+    fn truncate_flip_list_style_stack(&mut self) {
+        while let Some(cur_last_depth) = self.flipped_list_style_stack.last() {
+            if *cur_last_depth >= self.flipped_list_style_stack_truncate_pos {
+                self.flipped_list_style_stack.pop();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+struct MarkdownWriter<'a, I, W> {
+    /// Iterator supplying events.
+    iter: I,
+
+    /// Writer to write to.
+    writer: W,
+
+    phantom: core::marker::PhantomData<&'a ()>,
 }
 
 impl<'a, I, W> MarkdownWriter<'a, I, W>
@@ -159,6 +290,7 @@ where
         let mut stack = Vec::new();
         let mut incoming_stack = VecDeque::new();
         let mut outgoing_counter = 0;
+        let mut shared_state = SharedState::default();
         let mut iter = self.iter.peekable();
         // In general, we split markdown generation into a sequence of four actions
         // 1. Encountering a series of starts of block containers
@@ -244,20 +376,26 @@ where
             } else if state == 1 {
                 let remaining_stack_len = stack.len().checked_sub(outgoing_counter).unwrap();
                 if outgoing_counter != 0 {
+                    shared_state.set_flip_list_style_truncate_pos(remaining_stack_len);
                     Self::process_transition(
                         &mut self.writer,
+                        &mut shared_state,
                         &stack[0..remaining_stack_len],
                         &stack[remaining_stack_len..],
                         incoming_stack.make_contiguous(),
                     )?;
                     stack.drain(remaining_stack_len..);
+                    shared_state.truncate_flip_list_style_stack();
                 }
-                Self::process_enter_nesting(&mut self.writer, &mut stack, &mut incoming_stack)?;
+                Self::process_enter_nesting(
+                    &mut self.writer,
+                    &shared_state,
+                    &mut stack,
+                    &mut incoming_stack,
+                )?;
                 stack.extend(incoming_stack.drain(..));
             } else if state == 2 {
-                if let (4, Some(Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))))) =
-                    (new_state, stack.last())
-                {
+                if let (4, Some(Event::Start(Tag::CodeBlock(_)))) = (new_state, stack.last()) {
                     if let Some(Event::Text(text_str)) = incoming_stack.back_mut() {
                         // FIXME pulldown_cmark leaves a `\n` here if `new_state` is 4,
                         // and doesn't leave one here if `new_state` is 0.
@@ -290,16 +428,24 @@ where
                 incoming_stack.push_back(iter.next().unwrap());
                 if state == 4 {
                     let remaining_stack_len = stack.len().checked_sub(outgoing_counter).unwrap();
+                    shared_state.set_flip_list_style_truncate_pos(remaining_stack_len);
                     Self::process_transition(
                         &mut self.writer,
+                        &mut shared_state,
                         &stack[0..remaining_stack_len],
                         &stack[remaining_stack_len..],
                         incoming_stack.make_contiguous(),
                     )?;
                     stack.drain(remaining_stack_len..);
+                    shared_state.truncate_flip_list_style_stack();
                 }
                 outgoing_counter = 0;
-                Self::process_enter_nesting(&mut self.writer, &mut stack, &mut incoming_stack)?;
+                Self::process_enter_nesting(
+                    &mut self.writer,
+                    &shared_state,
+                    &mut stack,
+                    &mut incoming_stack,
+                )?;
                 stack.extend(incoming_stack.drain(..));
                 outgoing_counter += 1;
                 new_state = 4;
@@ -316,6 +462,7 @@ where
 
     fn process_transition(
         writer: &mut W,
+        shared_state: &mut SharedState,
         context: &[Event<'a>],
         removing_sequence: &[Event<'a>],
         added_sequence: &[Event<'a>],
@@ -324,44 +471,81 @@ where
             DoNothing,
             NewlineAndRenew,
             ExtraNewlineAndRenew,
+            FlipListStyleNewlineAndRenew,
         }
         let mut strategy = None;
-        if strategy.is_none() && added_sequence.is_empty() && context.is_empty() {
-            strategy = Some(TransitionStrategy::DoNothing);
-        }
-
-        if strategy.is_none() {
-            match (removing_sequence, added_sequence) {
-                ([Event::Start(Tag::Paragraph)], [Event::Start(Tag::Paragraph)]) => {
-                    strategy = Some(TransitionStrategy::ExtraNewlineAndRenew);
-                }
-                ([Event::Start(Tag::Heading(_))], [Event::Start(Tag::Heading(_))]) => {
-                    strategy = Some(TransitionStrategy::NewlineAndRenew);
-                }
-                (
-                    [Event::Start(Tag::BlockQuote), Event::Start(Tag::Paragraph)],
-                    [Event::Start(Tag::BlockQuote), Event::Start(Tag::Paragraph)],
-                ) => {
-                    strategy = Some(TransitionStrategy::ExtraNewlineAndRenew);
-                }
-                ([Event::Html(_)], [Event::Html(_)]) => {
-                    strategy = Some(TransitionStrategy::DoNothing);
-                }
-                ([Event::Text(_)], [Event::Text(_)]) => {
-                    // FIXME: This is the tight list case.
-                    strategy = Some(TransitionStrategy::DoNothing);
-                }
-                _ => {}
+        match (removing_sequence, added_sequence) {
+            ([], []) => {
+                strategy = Some(TransitionStrategy::DoNothing);
             }
-        }
-
-        if strategy.is_none() {
-            match removing_sequence {
-                [Event::Start(Tag::List(_)), ..] => {
-                    strategy = Some(TransitionStrategy::ExtraNewlineAndRenew);
-                }
-                _ => {}
+            ([Event::Start(Tag::Paragraph)], [Event::Start(Tag::Paragraph)])
+            | (
+                [Event::Start(Tag::Paragraph)],
+                [Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)), ..],
+            )
+            | ([Event::Start(Tag::BlockQuote), ..], [Event::Start(Tag::BlockQuote), ..])
+            | ([Event::Start(Tag::List(_)), ..], [Event::Start(Tag::Paragraph)]) => {
+                strategy = Some(TransitionStrategy::ExtraNewlineAndRenew);
             }
+            ([Event::Start(Tag::List(_)), ..], [Event::Start(Tag::List(_)), ..]) => {
+                strategy = Some(TransitionStrategy::FlipListStyleNewlineAndRenew)
+            }
+            ([Event::Html(_)], [Event::Start(Tag::Paragraph)])
+            | ([Event::Html(_)], [Event::Start(Tag::CodeBlock(_)), ..])
+            | ([Event::Html(_)], [Event::Start(Tag::List(_)), ..]) => {
+                // FIXME: Certain kinds of Html block needs extra newline.
+                // however those are provided within the current html block text.
+                strategy = Some(TransitionStrategy::NewlineAndRenew);
+            }
+            ([Event::Start(Tag::Paragraph)], [Event::Start(Tag::Heading(_))])
+            | (
+                [Event::Start(Tag::Paragraph)],
+                [Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))), ..],
+            )
+            | ([Event::Start(Tag::Paragraph)], [Event::Start(Tag::List(_)), ..])
+            | ([Event::Start(Tag::Paragraph)], [Event::Rule])
+            | ([Event::Start(Tag::Paragraph)], [Event::Html(_)])
+            | ([Event::Start(Tag::Paragraph)], [Event::Start(Tag::BlockQuote), ..])
+            | ([Event::Start(Tag::Heading(_))], [Event::Start(Tag::Paragraph)])
+            | ([Event::Start(Tag::Heading(_))], [Event::Start(Tag::Heading(_))])
+            | ([Event::Start(Tag::Heading(_))], [Event::Start(Tag::CodeBlock(_))])
+            | ([Event::Start(Tag::Heading(_))], [Event::Start(Tag::BlockQuote), ..])
+            | ([Event::Start(Tag::Heading(_))], [Event::Rule])
+            | ([Event::Start(Tag::Heading(_))], [Event::Text(_)])
+            | ([Event::Start(Tag::CodeBlock(_)), ..], [Event::Start(Tag::Paragraph)])
+            | ([Event::Start(Tag::CodeBlock(_)), ..], [Event::Start(Tag::Heading(_))])
+            | ([Event::Start(Tag::CodeBlock(_)), ..], [Event::Start(Tag::List(_)), ..])
+            | ([Event::Start(Tag::CodeBlock(_)), ..], [Event::Start(Tag::BlockQuote), ..])
+            | ([Event::Start(Tag::CodeBlock(_)), ..], [Event::Rule])
+            | ([Event::Start(Tag::CodeBlock(_)), ..], [Event::Html(_)])
+            | ([Event::Start(Tag::BlockQuote), ..], [Event::Start(Tag::Paragraph)])
+            | ([Event::Start(Tag::BlockQuote), ..], [Event::Start(Tag::Heading(_))])
+            | ([Event::Start(Tag::BlockQuote), ..], [Event::Start(Tag::CodeBlock(_)), ..])
+            | ([Event::Start(Tag::BlockQuote), ..], [Event::Start(Tag::List(_)), ..])
+            | ([Event::Start(Tag::BlockQuote), ..], [Event::Rule])
+            | ([Event::Start(Tag::List(_)), ..], [Event::Rule])
+            | ([Event::Start(Tag::List(_)), ..], [Event::Html(_)])
+            | ([Event::Rule], [Event::Rule])
+            | ([Event::Rule], [Event::Start(Tag::Paragraph)])
+            | ([Event::Rule], [Event::Start(Tag::Heading(_))])
+            | ([Event::Rule], [Event::Start(Tag::BlockQuote), ..])
+            | ([Event::Rule], [Event::Start(Tag::CodeBlock(_)), ..])
+            | ([Event::Rule], [Event::Start(Tag::List(_)), ..])
+            | ([Event::Start(Tag::Item), ..], [Event::Start(Tag::Item), ..])
+            | ([Event::Text(_)], [Event::Start(Tag::List(_)), ..])
+            | ([Event::Text(_)], [Event::Start(Tag::BlockQuote), ..]) => {
+                strategy = Some(TransitionStrategy::NewlineAndRenew);
+            }
+            ([Event::Text(_)], [Event::Text(_)]) => {
+                // FIXME: This is the tight list case.
+                strategy = Some(TransitionStrategy::DoNothing);
+            }
+            ([Event::Html(_)], [Event::Html(_)]) => {
+                // FIXME: Certain kinds of Html block needs extra newline.
+                // however those are provided within the current html block text.
+                strategy = Some(TransitionStrategy::DoNothing);
+            }
+            _ => {}
         }
 
         let strategy = match strategy {
@@ -383,6 +567,14 @@ where
                 writer.write_str("\n")?;
                 Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
             }
+            TransitionStrategy::FlipListStyleNewlineAndRenew => {
+                debug_assert_eq!(context.len(), shared_state.flip_list_style_truncate_pos());
+                shared_state.set_flip_list_style_truncate_pos(context.len() + 1);
+                shared_state.truncate_flip_list_style_stack();
+                shared_state.flip_list_style(context.len());
+                writer.write_str("\n")?;
+                Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
+            }
             TransitionStrategy::ExtraNewlineAndRenew => {
                 writer.write_str("\n")?;
                 Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
@@ -394,6 +586,7 @@ where
     }
     fn process_enter_nesting(
         writer: &mut W,
+        shared_state: &SharedState,
         context: &mut Vec<Event<'a>>,
         sequence: &mut VecDeque<Event<'a>>,
     ) -> io::Result<()> {
@@ -441,23 +634,35 @@ where
                             writer.write_str("\n")?;
                             Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
                         }
-                        Tag::Item => match context.last_mut() {
-                            Some(Event::Start(Tag::List(style))) => {
-                                if let Some(idx) = style {
-                                    let str = format!("{}. ", idx);
-                                    writer.write_str(&str)?;
-                                    *idx += 1;
-                                } else {
-                                    writer.write_str("* ")?;
+                        Tag::Item => {
+                            let context_len = context.len();
+                            match context.last_mut() {
+                                Some(Event::Start(Tag::List(style))) => {
+                                    if let Some(idx) = style {
+                                        let str =
+                                            if !shared_state.is_list_style_flipped(context_len - 1) {
+                                                format!("{}. ", idx)
+                                            } else {
+                                                format!("{}) ", idx)
+                                            };
+                                        writer.write_str(&str)?;
+                                        *idx += 1;
+                                    } else {
+                                        if !shared_state.is_list_style_flipped(context_len - 1) {
+                                            writer.write_str("* ")?;
+                                        } else {
+                                            writer.write_str("- ")?;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    eprintln!(
+                                        "item encountered but list context not found: {:?}",
+                                        context
+                                    );
                                 }
                             }
-                            _ => {
-                                eprintln!(
-                                    "item encountered but list context not found: {:?}",
-                                    context
-                                );
-                            }
-                        },
+                        }
                         _ => {
                             eprintln!(
                                 "unhandled enter nesting event {:?}, remaining: {:?}",
@@ -593,13 +798,15 @@ where
         context: &[Event<'a>],
         sequence: &[Event<'a>],
     ) -> io::Result<()> {
-        let mut iter = sequence.iter().peekable();
-        while let Some(event) = iter.peek() {
+        let mut iter = sequence.iter().enumerate().peekable();
+
+        let resolution = resolve_emphasis_and_strong(sequence);
+        while let Some((event_idx, event)) = iter.peek() {
             if let Event::Text(text) = event {
                 if let Some(Event::Start(Tag::CodeBlock(_))) = context.last() {
                     writer.write_str(&**text)?;
                 } else if let Some(Event::Start(Tag::Heading(_))) = context.last() {
-                    writer.write_str(&*escape_text(text, EscapeOptions::ESCAPE_LINEFEED))?;
+                    writer.write_str(&*escape_text(text, EscapeOptions::default()))?;
                 } else {
                     writer.write_str(&*escape_text(text, EscapeOptions::default()))?;
                 }
@@ -609,8 +816,7 @@ where
                 let _ = iter.next();
             } else if let Event::SoftBreak = event {
                 if let Some(Event::Start(Tag::Heading(_))) = context.last() {
-                    writer
-                        .write_str(&*escape_text(&'\n'.into(), EscapeOptions::ESCAPE_LINEFEED))?;
+                    writer.write_str(&*escape_text(&'\n'.into(), EscapeOptions::default()))?;
                 } else {
                     writer.write_str("\n")?;
                     Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
@@ -621,21 +827,50 @@ where
                 Self::renew_nonnesting_sequence_line_start(writer, context, &[])?;
                 let _ = iter.next();
             } else if let Event::Code(str) = event {
-                writer.write_str("`")?;
+                let mut delim_str = String::new();
+                loop {
+                    delim_str += "`";
+                    if str.find(&delim_str).is_none() {
+                        break;
+                    }
+                }
+                let need_space_delim = (str.starts_with(' ')
+                    || str.starts_with('`')
+                    || str.ends_with(' ')
+                    || str.ends_with('`'))
+                    && str.chars().any(|ch| !ch.is_whitespace());
+                writer.write_str(&delim_str)?;
+                if need_space_delim {
+                    writer.write_str(" ")?;
+                }
                 writer.write_str(str)?;
-                writer.write_str("`")?;
+                if need_space_delim {
+                    writer.write_str(" ")?;
+                }
+                writer.write_str(&delim_str)?;
                 let _ = iter.next();
-            } else if let Event::Start(Tag::Emphasis) = event {
-                writer.write_str("*")?;
-                let _ = iter.next();
-            } else if let Event::End(Tag::Emphasis) = event {
-                writer.write_str("*")?;
-                let _ = iter.next();
-            } else if let Event::Start(Tag::Strong) = event {
-                writer.write_str("**")?;
-                let _ = iter.next();
-            } else if let Event::End(Tag::Strong) = event {
-                writer.write_str("**")?;
+            } else if let Event::Start(Tag::Emphasis)
+            | Event::Start(Tag::Strong)
+            | Event::End(Tag::Emphasis)
+            | Event::End(Tag::Strong) = event
+            {
+                let state_id = resolution
+                    .binary_search_by(|state| state.event_idx.cmp(event_idx))
+                    .unwrap();
+                let state = &resolution[state_id];
+                if !state.resolution.use_underscore {
+                    if !state.resolution.is_strong {
+                        writer.write_str("*")?;
+                    } else {
+                        writer.write_str("**")?;
+                    }
+                } else {
+                    if !state.resolution.is_strong {
+                        writer.write_str("_")?;
+                    } else {
+                        writer.write_str("__")?;
+                    }
+                }
                 let _ = iter.next();
             } else if let Event::Html(html_str) = event {
                 writer.write_str(&**html_str)?;
@@ -645,6 +880,20 @@ where
                 match kind {
                     LinkType::Autolink | LinkType::Email => {
                         writer.write_str("<")?;
+                        let _ = iter.next();
+                        let linktext = iter.next();
+                        let linkend = iter.peek();
+                        if let Some((_, Event::End(Tag::Link(end_kind, _, _)))) = linkend {
+                            assert_eq!(kind, end_kind);
+                        } else {
+                            unreachable!();
+                        }
+                        if let Some((_, Event::Text(str))) = linktext {
+                            writer.write_str(&**str)?;
+                        } else {
+                            unreachable!();
+                        }
+                        writer.write_str(">")?;
                     }
                     _ => {
                         writer.write_str("[")?;
@@ -654,12 +903,15 @@ where
             } else if let Event::End(Tag::Link(kind, target, title)) = event {
                 // FIXME
                 match kind {
-                    LinkType::Autolink | LinkType::Email => {
-                        writer.write_str(">")?;
+                    LinkType::Autolink => {
+                        unreachable!();
+                    }
+                    LinkType::Email => {
+                        unreachable!();
                     }
                     _ => {
                         writer.write_str("](")?;
-                        writer.write_str(target)?;
+                        writer.write_str(&*escape_url(target))?;
                         if !title.is_empty() {
                             writer.write_str(" \"")?;
                             writer.write_str(title)?;
@@ -676,7 +928,7 @@ where
             } else if let Event::End(Tag::Image(_, target, title)) = event {
                 // FIXME
                 writer.write_str("](")?;
-                writer.write_str(target)?;
+                writer.write_str(&*escape_url(target))?;
                 if !title.is_empty() {
                     writer.write_str(" \"")?;
                     writer.write_str(title)?;
